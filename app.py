@@ -1,12 +1,19 @@
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
-from weasyprint import HTML
 import uuid
 import os
 from datetime import datetime
+import io
+
+# Use reportlab instead of weasyprint (more reliable on Render)
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
+from reportlab.lib.units import inch
 
 app = Flask(__name__)
-CORS(app)  # Allow requests from your Vercel app
+CORS(app)
 
 # Create folder for generated PDFs
 PDF_FOLDER = 'generated_pdfs'
@@ -34,22 +41,18 @@ def generate_pdf():
         filename = f"invoice_{pdf_id}.pdf"
         filepath = os.path.join(PDF_FOLDER, filename)
         
-        # Generate HTML from received data
-        html_content = generate_invoice_html(data)
-        
-        # Create PDF
-        HTML(string=html_content).write_pdf(filepath)
+        # Generate PDF using reportlab
+        generate_pdf_reportlab(filepath, data)
         
         # Generate URLs
         pdf_url = f"https://{request.host}/pdfs/{filename}"
         
         # Get customer phone for WhatsApp
         customer_phone = data.get('customer', {}).get('phone', '')
-        # Remove any non-digit characters
         customer_phone = ''.join(filter(str.isdigit, customer_phone))
         
         # Prepare WhatsApp link
-        message = f"Your invoice is ready! 📄\\n\\nDownload: {pdf_url}\\n\\nThank you for choosing Roburwoods Furniture!"
+        message = f"Your invoice is ready! 📄\n\nDownload: {pdf_url}\n\nThank you for choosing Roburwoods Furniture!"
         whatsapp_link = f"https://wa.me/{customer_phone}?text={message}" if customer_phone else None
         
         return jsonify({
@@ -64,124 +67,109 @@ def generate_pdf():
         print(f"Error: {str(e)}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
-@app.route('/pdfs/<filename>', methods=['GET'])
-def download_pdf(filename):
-    filepath = os.path.join(PDF_FOLDER, filename)
-    if os.path.exists(filepath):
-        return send_file(filepath, as_attachment=False, mimetype='application/pdf')
-    return jsonify({'error': 'File not found'}), 404
-
-def generate_invoice_html(data):
-    customer = data.get('customer', {})
-    items = data.get('items', [])
-    subtotal = data.get('subtotal', 0)
-    tax = data.get('tax', 0)
-    total = data.get('total', 0)
-    invoice_number = data.get('invoice_number', f"INV-{datetime.now().strftime('%Y%m%d%H%M%S')}")
-    notes = data.get('notes', '')
+def generate_pdf_reportlab(filepath, data):
+    """Generate PDF using reportlab"""
+    doc = SimpleDocTemplate(filepath, pagesize=letter)
+    styles = getSampleStyleSheet()
+    story = []
     
-    items_html = ""
+    # Custom styles
+    title_style = ParagraphStyle(
+        'CustomTitle',
+        parent=styles['Heading1'],
+        fontSize=24,
+        textColor=colors.HexColor('#1a472a'),
+        alignment=1,  # Center
+        spaceAfter=20
+    )
+    
+    heading_style = ParagraphStyle(
+        'Heading',
+        parent=styles['Heading2'],
+        fontSize=16,
+        textColor=colors.HexColor('#2d5a3b'),
+        spaceAfter=10
+    )
+    
+    normal_style = styles['Normal']
+    
+    # Title
+    story.append(Paragraph("Roburwoods Furniture", title_style))
+    story.append(Paragraph("TAX INVOICE", heading_style))
+    story.append(Spacer(1, 20))
+    
+    # Customer info
+    customer = data.get('customer', {})
+    story.append(Paragraph(f"<b>Customer:</b> {customer.get('name', 'N/A')}", normal_style))
+    story.append(Paragraph(f"<b>Email:</b> {customer.get('email', 'N/A')}", normal_style))
+    story.append(Paragraph(f"<b>Phone:</b> {customer.get('phone', 'N/A')}", normal_style))
+    story.append(Paragraph(f"<b>Date:</b> {datetime.now().strftime('%Y-%m-%d')}", normal_style))
+    story.append(Spacer(1, 20))
+    
+    # Items table
+    items = data.get('items', [])
+    table_data = [['Item', 'Qty', 'Unit Price', 'Total']]
+    
     for item in items:
         qty = item.get('quantity', 0)
         price = item.get('unit_price', 0)
-        item_total = qty * price
-        items_html += f"""
-        <tr>
-            <td style="border: 1px solid #ddd; padding: 8px;">{item.get('name', 'Item')}</td>
-            <td style="border: 1px solid #ddd; padding: 8px; text-align: center;">{qty}</td>
-            <td style="border: 1px solid #ddd; padding: 8px; text-align: right;">${price:.2f}</td>
-            <td style="border: 1px solid #ddd; padding: 8px; text-align: right;">${item_total:.2f}</td>
-         </tr>
-        """
+        total = qty * price
+        table_data.append([
+            item.get('name', 'Item'),
+            str(qty),
+            f"${price:.2f}",
+            f"${total:.2f}"
+        ])
     
-    if not items_html:
-        items_html = '<tr><td colspan="4" style="text-align: center;">No items</td></tr>'
+    # Add totals row
+    subtotal = data.get('subtotal', 0)
+    tax = data.get('tax', 0)
+    total = data.get('total', 0)
+    table_data.append(['', '', '<b>Subtotal:</b>', f"<b>${subtotal:.2f}</b>"])
+    table_data.append(['', '', '<b>VAT (15%):</b>', f"<b>${tax:.2f}</b>"])
+    table_data.append(['', '', '<b>TOTAL:</b>', f"<b>${total:.2f} USD</b>"])
     
-    return f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="UTF-8">
-        <title>Invoice - Roburwoods Furniture</title>
-        <style>
-            body {{ font-family: Arial, sans-serif; padding: 40px; margin: 0; background: #f5f5f5; }}
-            .invoice-container {{ max-width: 800px; margin: 0 auto; background: white; border-radius: 8px; overflow: hidden; }}
-            .header {{ background: linear-gradient(135deg, #1a472a 0%, #2d5a3b 100%); padding: 30px; color: white; text-align: center; }}
-            .company-name {{ font-size: 28px; font-weight: bold; margin-bottom: 5px; }}
-            .title {{ font-size: 24px; margin: 20px 0; font-weight: bold; }}
-            .invoice-number {{ font-size: 14px; opacity: 0.9; }}
-            .content {{ padding: 30px; }}
-            .info-section {{ display: flex; justify-content: space-between; margin-bottom: 30px; background: #f5f5f5; padding: 15px; border-radius: 8px; }}
-            .info-box {{ flex: 1; }}
-            .info-label {{ font-weight: bold; color: #2d5a3b; margin-bottom: 5px; }}
-            table {{ width: 100%; border-collapse: collapse; margin: 20px 0; }}
-            th {{ background: #2d5a3b; color: white; padding: 12px; text-align: left; }}
-            td {{ border-bottom: 1px solid #ddd; padding: 10px; }}
-            .totals {{ text-align: right; margin-top: 20px; padding-top: 20px; border-top: 2px solid #2d5a3b; }}
-            .grand-total {{ font-size: 18px; font-weight: bold; color: #2d5a3b; margin-top: 10px; }}
-            .footer {{ background: #f5f5f5; padding: 20px; text-align: center; font-size: 11px; color: #666; margin-top: 30px; }}
-        </style>
-    </head>
-    <body>
-        <div class="invoice-container">
-            <div class="header">
-                <div class="company-name">Roburwoods Furniture</div>
-                <div class="title">TAX INVOICE</div>
-                <div class="invoice-number">#{invoice_number}</div>
-            </div>
-            <div class="content">
-                <div class="info-section">
-                    <div class="info-box">
-                        <div class="info-label">BILL TO</div>
-                        <p><strong>{customer.get('name', 'N/A')}</strong></p>
-                        <p>{customer.get('email', 'N/A')}</p>
-                        <p>{customer.get('phone', 'N/A')}</p>
-                        <p>{customer.get('address', 'N/A')}</p>
-                    </div>
-                    <div class="info-box">
-                        <div class="info-label">INVOICE DETAILS</div>
-                        <p><strong>Date:</strong> {datetime.now().strftime('%Y-%m-%d')}</p>
-                        <p><strong>Currency:</strong> USD</p>
-                    </div>
-                </div>
-                
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Item</th>
-                            <th style="text-align: center">Qty</th>
-                            <th style="text-align: right">Unit Price</th>
-                            <th style="text-align: right">Total</th>
-                         </tr>
-                    </thead>
-                    <tbody>
-                        {items_html}
-                    </tbody>
-                </table>
-                
-                <div class="totals">
-                    <div>Subtotal: ${subtotal:.2f}</div>
-                    <div>VAT (15%): ${tax:.2f}</div>
-                    <div class="grand-total">TOTAL: ${total:.2f} USD</div>
-                </div>
-                
-                {f'<div style="margin-top: 20px; padding: 10px; background: #e8f5e9; border-radius: 8px;"><strong>📝 Notes:</strong><br>{notes}</div>' if notes else ''}
-                
-                <div style="margin-top: 20px; padding: 15px; background: #e8f5e9; border-radius: 8px;">
-                    <strong>💰 Payment Information:</strong><br>
-                    • Bank Transfer: CBZ Bank, Account: 09026193970026<br>
-                    • EcoCash: Merchant Code 046756
-                </div>
-            </div>
-            <div class="footer">
-                <p>Roburwoods Furniture - 136 Elmswood Park, Marondera, Zimbabwe</p>
-                <p>Tel: +263 772761564 | Email: info@roburwoods.com</p>
-                <p>Thank you for choosing Roburwoods Furniture</p>
-            </div>
-        </div>
-    </body>
-    </html>
+    # Create table
+    table = Table(table_data, colWidths=[2.5*inch, 0.8*inch, 1.2*inch, 1.2*inch])
+    table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2d5a3b')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+        ('ALIGN', (1, 1), (-1, -1), 'CENTER'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 10),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+        ('BACKGROUND', (0, 1), (-1, -4), colors.beige),
+        ('GRID', (0, 0), (-1, -4), 1, colors.grey),
+        ('SPAN', (0, -3), (1, -3)),  # Span for Subtotal label
+        ('SPAN', (0, -2), (1, -2)),  # Span for VAT label
+        ('SPAN', (0, -1), (1, -1)),  # Span for TOTAL label
+        ('ALIGN', (2, -3), (-1, -1), 'RIGHT'),
+        ('FONTNAME', (2, -3), (-1, -1), 'Helvetica-Bold'),
+    ]))
+    
+    story.append(table)
+    story.append(Spacer(1, 20))
+    
+    # Notes
+    notes = data.get('notes', '')
+    if notes:
+        story.append(Paragraph(f"<b>Notes:</b> {notes}", normal_style))
+        story.append(Spacer(1, 10))
+    
+    # Footer
+    footer_text = """
+    <b>Payment Information:</b><br/>
+    • Bank Transfer: CBZ Bank, Account: 09026193970026<br/>
+    • EcoCash: Merchant Code 046756<br/>
+    <br/>
+    Roburwoods Furniture - 136 Elmswood Park, Marondera, Zimbabwe<br/>
+    Tel: +263 772761564 | Email: info@roburwoods.com
     """
+    story.append(Paragraph(footer_text, normal_style))
+    
+    # Build PDF
+    doc.build(story)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)

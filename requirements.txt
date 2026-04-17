@@ -1,4 +1,4 @@
 Flask==2.3.0
 flask-cors==4.0.0
-weasyprint==60.0
+reportlab==4.0.4
 gunicorn==21.2.0
